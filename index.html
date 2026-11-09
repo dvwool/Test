@@ -1,4 +1,4 @@
-﻿<title>Test</title>
+<title>StringSync</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
@@ -282,7 +282,7 @@
 
   var S = {
     device: null, chars: {}, connected: false, status: null, wifi: null,
-    sessions: [], expectRestart: false, reconnecting: false, cancelWait: false
+    sessions: [], lastSession: 0, expectRestart: false, reconnecting: false, cancelWait: false
   };
   var logLines = [];
   var msgTimer = null;
@@ -354,6 +354,7 @@
     try {
       await write(S.chars.command, Uint8Array.of(code));
       log("Sent: " + label);
+      setTimeout(pollOnce, 400);
       return true;
     } catch (e) {
       log("Command failed (" + label + "): " + e.message);
@@ -373,6 +374,40 @@
     }
   }
 
+  // Listen with addEventListener (more widely supported than the on... property)
+  var handlers = {};
+  function hook(name, fn) {
+    var c = S.chars[name];
+    if (!c) return;
+    if (handlers[name]) {
+      try { handlers[name].c.removeEventListener("characteristicvaluechanged", handlers[name].h); } catch (e) {}
+    }
+    var h = function (e) { fn(e.target.value); };
+    handlers[name] = { c: c, h: h };
+    c.addEventListener("characteristicvaluechanged", h);
+  }
+
+  // Fallback: ask the device for its status every few seconds, in case
+  // notifications are not delivered by this browser.
+  var pollTimer = null, polling = false;
+  function startPolling() {
+    stopPolling();
+    pollTimer = setInterval(pollOnce, 2500);
+  }
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+  async function pollOnce() {
+    if (polling || !S.connected || !S.chars.status) return;
+    polling = true;
+    try {
+      onStatus(await S.chars.status.readValue());
+      if (S.chars.wifi && S.status && S.status.state === 4) onWifi(await S.chars.wifi.readValue());
+      if (S.chars.session) onSession(await S.chars.session.readValue());
+    } catch (e) { /* the link may be restarting */ }
+    polling = false;
+  }
+
   async function openGatt() {
     log("Connecting...");
     var server = await S.device.gatt.connect();
@@ -384,12 +419,16 @@
     }
     if (!S.chars.status || !S.chars.command) throw new Error("This is not StringSync firmware.");
 
-    S.chars.status.oncharacteristicvaluechanged = function (e) { onStatus(e.target.value); };
-    if (S.chars.session) S.chars.session.oncharacteristicvaluechanged = function (e) { onSession(e.target.value); };
-    if (S.chars.wifi) S.chars.wifi.oncharacteristicvaluechanged = function (e) { onWifi(e.target.value); };
-    await S.chars.status.startNotifications();
-    if (S.chars.session) await S.chars.session.startNotifications();
-    if (S.chars.wifi) await S.chars.wifi.startNotifications();
+    hook("status", onStatus);
+    hook("session", onSession);
+    hook("wifi", onWifi);
+    var notifyNames = ["status", "session", "wifi"];
+    for (var ni = 0; ni < notifyNames.length; ni++) {
+      var nc = S.chars[notifyNames[ni]];
+      if (!nc) continue;
+      try { await nc.startNotifications(); }
+      catch (e) { log("Notifications unavailable for " + notifyNames[ni] + ": " + e.message); }
+    }
 
     S.connected = true;
     S.reconnecting = false;
@@ -397,6 +436,11 @@
     await syncClock();
     onStatus(await S.chars.status.readValue());
     if (S.chars.wifi) { try { onWifi(await S.chars.wifi.readValue()); } catch (e) {} }
+    if (S.chars.session) {
+      try { var sv = parseSession(await S.chars.session.readValue()); S.lastSession = sv ? sv.index : 0; }
+      catch (e) { S.lastSession = 0; }
+    }
+    startPolling();
     render();
   }
 
@@ -416,7 +460,8 @@
   }
   function onSession(dv) {
     var s = parseSession(dv);
-    if (!s || s.index === 0) return;
+    if (!s || s.index === 0 || s.index === S.lastSession) return;
+    S.lastSession = s.index;
     S.sessions.unshift(s);
     if (S.sessions.length > 30) S.sessions.length = 30;
     log("Recording saved: #" + s.index);
@@ -427,6 +472,7 @@
     S.connected = false;
     S.status = null;
     S.wifi = null;
+    stopPolling();
     log("Disconnected");
     render();
     if (S.expectRestart) autoReconnect();
@@ -710,5 +756,6 @@
   $("ssid").value = recall("ssid");
   checkSupport();
   render();
+  log("Page version 2 (status polling)");
 })();
 </script>
